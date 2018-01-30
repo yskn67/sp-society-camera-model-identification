@@ -21,6 +21,7 @@ from keras.layers import concatenate, Lambda, Input, Dense, Dropout, Flatten, Co
         BatchNormalization, Activation, GlobalAveragePooling2D, Reshape
 from keras.utils import to_categorical
 from keras.applications import *
+from keras.applications.densenet import *
 from keras import backend as K
 from keras.engine.topology import Layer
 
