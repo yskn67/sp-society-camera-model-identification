@@ -22,6 +22,7 @@ from keras.layers import concatenate, Lambda, Input, Dense, Dropout, Flatten, Co
 from keras.utils import to_categorical
 from keras.applications import *
 from keras.applications.densenet import *
+from ResNeXt.resnext import *
 from keras import backend as K
 from keras.engine.topology import Layer
 

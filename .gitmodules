@@ -1,0 +1,3 @@
+[submodule "ResNeXt"]
+	path = ResNeXt
+	url = https://github.com/yskn67/Keras-ResNeXt.git
