@@ -22,11 +22,11 @@ from keras.layers import concatenate, Lambda, Input, Dense, Dropout, Flatten, Co
 from keras.utils import to_categorical
 from keras.applications import *
 from keras.applications.densenet import *
-from ResNeXt.resnext import *
 from keras import backend as K
 from keras.engine.topology import Layer
 
 from multi_gpu_keras import multi_gpu_model
+from sklearn.externals import joblib
 
 import skimage
 from iterm import show_image
@@ -66,6 +66,7 @@ parser.add_argument('-do', '--dropout', type=float, default=0.3, help='Dropout r
 parser.add_argument('-doc', '--dropout-classifier', type=float, default=0., help='Dropout rate for classifier')
 parser.add_argument('-t', '--test', action='store_true', help='Test model and generate CSV submission file')
 parser.add_argument('-tt', '--test-train', action='store_true', help='Test model on the training set')
+parser.add_argument('-tp', '--test-prob', action='store_true', help='Test model and generate probability CSV file')
 parser.add_argument('-cs', '--crop-size', type=int, default=512, help='Crop size')
 parser.add_argument('-g', '--gpus', type=int, default=1, help='Number of GPUs to use')
 parser.add_argument('-p', '--pooling', type=str, default='avg', help='Type of pooling to use: avg|max|none')
@@ -149,6 +150,7 @@ MANIPULATIONS = ['jpg70', 'jpg90', 'gamma0.8', 'gamma1.2', 'bicubic0.5', 'bicubi
 N_CLASSES = len(CLASSES)
 load_img_fast_jpg  = lambda img_path: jpeg.JPEG(img_path).decode()
 load_img           = lambda img_path: np.array(Image.open(img_path))
+
 
 def random_manipulation(img, manipulation=None):
 
@@ -244,14 +246,20 @@ def get_class(class_name):
     assert class_idx in range(N_CLASSES)
     return class_idx
 
-def process_item(item, training, transforms=[[]]):
-
-    class_name = item.split('/')[-2]
+def process_item(item, training, transforms=[[]], names={}):
+  
+    if item.startswith("test"):
+        class_name = names[item.split('/')[-1]]
+    else:
+        class_name = item.split('/')[-2]
     class_idx = get_class(class_name)
 
     validation = not training 
 
-    img = load_img_fast_jpg(item)
+    if item.startswith("test"):
+        img = np.array(Image.open(item))
+    else:
+        img = load_img_fast_jpg(item)
 
     shape = list(img.shape[:2])
 
@@ -282,13 +290,10 @@ def process_item(item, training, transforms=[[]]):
         force_orientation  = ('orientation'  in transform) and ORIENTATION_FLIP_ALLOWED[class_idx]
 
         # some images are landscape, others are portrait, so augment training by randomly changing orientation
-        if ((np.random.rand() < 0.5) and training and ORIENTATION_FLIP_ALLOWED[class_idx]) or force_orientation:
-            img = np.rot90(_img, 1, (0,1))
+        if ((np.random.rand() < 0.5) and training) or force_orientation:
+            img = np.rot90(_img, 3, (0,1))
             # is it rot90(..3..), rot90(..1..) or both? 
             # for phones with landscape mode pics could be taken upside down too, although less likely
-            # most of the test images that are flipped are 1
-            # however,eg. img_4d7be4c_unalt looks 3
-            # and img_4df3673_manip img_6a31fd7_unalt looks 2!
         else:
             img = _img
 
@@ -343,13 +348,14 @@ def gen(items, batch_size, training=True):
     p = Pool(cpu_count()-2)
 
     transforms = VALIDATION_TRANSFORMS if validation else [[]]
+    res = joblib.load("test_correct.pkl")
 
     while True:
 
         if training:
             random.shuffle(items)
 
-        process_item_func  = partial(process_item, training=training, transforms=transforms)
+        process_item_func  = partial(process_item, training=training, transforms=transforms, names=res)
 
         batch_idx = 0
         iter_items = iter(items)
@@ -501,17 +507,10 @@ else:
             match = re.search(r'([A-Za-z_\d\.]+)-epoch(\d+)-.*\.hdf5', args.weights)
             last_epoch = int(match.group(2))
 
-def print_distribution(ids, classes=None):
-    if classes is None:
-        classes = [get_class(idx.split('/')[-2]) for idx in ids]
-    classes_count = np.bincount(classes)
-    for class_name, class_count in zip(CLASSES, classes_count):
-        print('{:>22}: {:5d} ({:04.1f}%)'.format(class_name, class_count, 100. * class_count / len(classes)))
-
 model.summary()
 model = multi_gpu_model(model, gpus=args.gpus)
 
-if not (args.test or args.test_train):
+if not (args.test or args.test_train or args.test_prob):
 
     # TRAINING
     ids = glob.glob(join(TRAIN_FOLDER,'*/*.jpg'))
@@ -530,35 +529,31 @@ if not (args.test or args.test_train):
         extra_train_ids = [idx for idx in extra_train_ids if idx not in low_quality]
         extra_train_ids.sort()
         ids_train.extend(extra_train_ids)
-        random.shuffle(ids_train)
 
         extra_val_ids = glob.glob(join(EXTRA_VAL_FOLDER,'*/*.jpg'))
         extra_val_ids.sort()
         ids_val.extend(extra_val_ids)
 
-        classes_val = [get_class(idx.split('/')[-2]) for idx in ids_val]
-        classes_val_count = np.bincount(classes_val)
-        max_classes_val_count = max(classes_val_count)
+    classes = [get_class(idx.split('/')[-2]) for idx in ids_train]
+    
+    add_ids = []
+    add_classes = []
+    res = joblib.load("test_correct.pkl")
+    for k, v in res.items():
+        add_ids.append(TEST_FOLDER + '/' + k)
+        add_classes.append(get_class(v))
 
-        # Balance validation dataset by filling up classes with less items from training set (and removing those from there)
-        for class_idx in range(N_CLASSES):
-            idx_to_transfer = [idx for idx in ids_train \
-                if get_class(idx.split('/')[-2]) == class_idx][:max_classes_val_count-classes_val_count[class_idx]]
+    ids_train = ids_train + add_ids
+    classes = classes + add_classes
 
-            ids_train = list(set(ids_train).difference(set(idx_to_transfer)))
+    # TODO: Filter out invalid images here to avoid (slight) class imbalance
+    # TODO: balance validation set
 
-            ids_val.extend(idx_to_transfer)
+    classes_count = np.bincount(classes)
+    for class_name, class_count in zip(CLASSES, classes_count):
+        print('{:>22}: {:5d} ({:04.1f}%)'.format(class_name, class_count, 100. * class_count / len(classes)))
 
-        random.shuffle(ids_val)
-
-    print("Training set distribution:")
-    print_distribution(ids_train)
-
-    print("Validation set distribution:")
-    print_distribution(ids_val)
-
-    classes_train = [get_class(idx.split('/')[-2]) for idx in ids_train]
-    class_weight = class_weight.compute_class_weight('balanced', np.unique(classes_train), classes_train)
+    class_weight = class_weight.compute_class_weight('balanced', np.unique(classes), classes)
 
     opt = Adam(lr=args.learning_rate)
     #opt = SGD(lr=args.learning_rate, decay=1e-6, momentum=0.9, nesterov=True)
@@ -579,7 +574,7 @@ if not (args.test or args.test_train):
             monitor=monitor,
             verbose=0,  save_best_only=True, save_weights_only=False, mode='max', period=1)
 
-    reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=5, min_lr=1e-9, epsilon = 0.00001, verbose=1, mode='max')
+    reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=10, min_lr=1e-9, epsilon = 0.00001, verbose=1, mode='max')
 
     model.fit_generator(
             generator        = gen(ids_train, args.batch_size),
@@ -594,7 +589,7 @@ if not (args.test or args.test_train):
 
 else:
     # TEST
-    if args.test:
+    if args.test or args.test_prob:
         ids = glob.glob(join(TEST_FOLDER,'*.tif'))
     elif args.test_train:
         ids = glob.glob(join(TRAIN_FOLDER,'*/*.jpg'))
@@ -606,13 +601,20 @@ else:
     match = re.search(r'([^/]*)\.hdf5', args.model)
     model_name = match.group(1) + ('_tta_' + args.ensembling if args.tta else '')
     csv_name   = 'submission_' + model_name + '.csv'
-    with conditional(args.test, open(csv_name, 'w')) as csvfile:
+    if args.test_prob:
+        csv_name   = 'submission_' + model_name + '_prob.csv'
+    with conditional(args.test or args.test_prob, open(csv_name, 'w')) as csvfile:
 
         if args.test:
             csv_writer = csv.writer(csvfile, delimiter=',',quotechar='|', quoting=csv.QUOTE_MINIMAL)
             csv_writer.writerow(['fname','camera'])
             classes = []
+        elif args.test_prob:
+            csv_writer = csv.writer(csvfile, delimiter=',',quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            csv_writer.writerow(['fname'] + [str(i) for i in range(len(CLASSES))])
+            classes = []
         else:
+            confusion_matrix = np.zeros([len(CLASSES), len(CLASSES)])
             correct_predictions = 0
 
         for i, idx in enumerate(tqdm(ids)):
@@ -645,7 +647,7 @@ else:
                 manipulated = np.copy(original_manipulated)
 
                 if 'orientation' in transform:
-                    img = np.rot90(img, 1, (0,1))
+                    img = np.rot90(img, 3, (0,1))
                 if 'manipulation' in transform and not original_manipulated:
                     img = random_manipulation(img)
                     manipulated = np.float32([1.])
@@ -673,6 +675,7 @@ else:
 
             if args.test_train:
                 class_idx = get_class(idx.split('/')[-2])
+                confusion_matrix[class_idx][prediction_class_idx] += 1
                 if class_idx == prediction_class_idx:
                     correct_predictions += 1
 
@@ -680,11 +683,19 @@ else:
                 csv_writer.writerow([idx.split('/')[-1], CLASSES[prediction_class_idx]])
                 classes.append(prediction_class_idx)
 
+            if args.test_prob:
+                csv_writer.writerow([idx.split('/')[-1]] + [str(p) for p in prediction[0]])
+                classes.append(prediction_class_idx)
+
         if args.test_train:
-            print("Accuracy: " + str(correct_predictions / (len(transforms) * i)))
+            print("Accuracy: " + str(correct_predictions / i))
+            print("   ", "\t".join([str(i) for i in range(len(CLASSES))]), sep="\t")
+            for i, r in enumerate(confusion_matrix):
+                print("{:3d}".format(i), "\t".join([str(e) for e in r]), sep="\t")
 
         if args.test:
-            print("Test set predictions distribution:")
-            print_distribution(None, classes=classes)
+            classes_count = np.bincount(classes)
+            for class_name, class_count in zip(CLASSES, classes_count):
+                print('{:>22}: {:5d} ({:04.1f}%)'.format(class_name, class_count, 100. * class_count / len(classes)))
             print("Now you are ready to:")
             print("kg submit {}".format(csv_name))
